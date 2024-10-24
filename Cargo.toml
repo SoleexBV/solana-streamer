@@ -29,7 +29,8 @@ solana-metrics = "=1.18.22"
 solana-perf = "=1.18.22"
 solana-sdk = "=1.18.22"
 thiserror = "1.0.56"
-tokio = { version = "1.29.1", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 x509-parser = "0.14.0"
 
 [dev-dependencies]

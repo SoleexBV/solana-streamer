@@ -51,14 +51,15 @@ use {
         // but if we do, the scope of the RwLock must always be a subset of the async Mutex
         // (i.e. lock order is always async Mutex -> RwLock). Also, be careful not to
         // introduce any other awaits while holding the RwLock.
+        select,
         sync::{Mutex, MutexGuard},
         task::JoinHandle,
         time::{sleep, timeout},
     },
+    tokio_util::sync::CancellationToken,
 };
 
-const WAIT_FOR_STREAM_TIMEOUT: Duration = Duration::from_millis(100);
-pub const DEFAULT_WAIT_FOR_CHUNK_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_WAIT_FOR_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 
@@ -373,7 +374,7 @@ fn handle_and_cache_new_connection(
             remote_addr,
         );
 
-        if let Some((last_update, stream_exit, stream_counter)) = connection_table_l
+        if let Some((last_update, cancel_connection, stream_counter)) = connection_table_l
             .try_add_connection(
                 ConnectionTableKey::new(remote_addr.ip(), params.remote_pubkey),
                 remote_addr.port(),
@@ -395,7 +396,7 @@ fn handle_and_cache_new_connection(
                 remote_addr,
                 last_update,
                 connection_table,
-                stream_exit,
+                cancel_connection,
                 params.clone(),
                 wait_for_chunk_timeout,
                 stream_load_ema,
@@ -756,7 +757,7 @@ async fn handle_connection(
     remote_addr: SocketAddr,
     last_update: Arc<AtomicU64>,
     connection_table: Arc<Mutex<ConnectionTable>>,
-    stream_exit: Arc<AtomicBool>,
+    cancel: CancellationToken,
     params: NewConnectionHandlerParams,
     wait_for_chunk_timeout: Duration,
     stream_load_ema: Arc<StakedStreamLoadEMA>,
@@ -771,107 +772,114 @@ async fn handle_connection(
     );
     let stable_id = connection.stable_id();
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
-    while !stream_exit.load(Ordering::Relaxed) {
-        if let Ok(stream) =
-            tokio::time::timeout(WAIT_FOR_STREAM_TIMEOUT, connection.accept_uni()).await
-        {
-            match stream {
-                Ok(mut stream) => {
-                    let max_streams_per_throttling_interval = stream_load_ema
-                        .available_load_capacity_in_throttling_duration(
-                            params.peer_type,
-                            params.total_stake,
-                        );
-
-                    let throttle_interval_start =
-                        stream_counter.reset_throttling_params_if_needed();
-                    let streams_read_in_throttle_interval =
-                        stream_counter.stream_count.load(Ordering::Relaxed);
-                    if streams_read_in_throttle_interval >= max_streams_per_throttling_interval {
-                        // The peer is sending faster than we're willing to read. Sleep for what's
-                        // left of this read interval so the peer backs off.
-                        let throttle_duration = STREAM_THROTTLING_INTERVAL
-                            .saturating_sub(throttle_interval_start.elapsed());
-
-                        if !throttle_duration.is_zero() {
-                            debug!("Throttling stream from {remote_addr:?}, peer type: {:?}, total stake: {}, \
-                                    max_streams_per_interval: {max_streams_per_throttling_interval}, read_interval_streams: {streams_read_in_throttle_interval} \
-                                    throttle_duration: {throttle_duration:?}",
-                                    params.peer_type, params.total_stake);
-                            stats.throttled_streams.fetch_add(1, Ordering::Relaxed);
-                            match params.peer_type {
-                                ConnectionPeerType::Unstaked => {
-                                    stats
-                                        .throttled_unstaked_streams
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                                ConnectionPeerType::Staked(_) => {
-                                    stats
-                                        .throttled_staked_streams
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            sleep(throttle_duration).await;
-                        }
-                    }
-                    stream_load_ema.increment_load(params.peer_type);
-                    stream_counter.stream_count.fetch_add(1, Ordering::Relaxed);
-                    stats.total_streams.fetch_add(1, Ordering::Relaxed);
-                    stats.total_new_streams.fetch_add(1, Ordering::Relaxed);
-                    let stream_exit = stream_exit.clone();
-                    let stats = stats.clone();
-                    let packet_sender = params.packet_sender.clone();
-                    let last_update = last_update.clone();
-                    let stream_load_ema = stream_load_ema.clone();
-                    tokio::spawn(async move {
-                        let mut maybe_batch = None;
-                        // The min is to guard against a value too small which can wake up unnecessarily
-                        // frequently and wasting CPU cycles. The max guard against waiting for too long
-                        // which delay exit and cause some test failures when the timeout value is large.
-                        // Within this value, the heuristic is to wake up 10 times to check for exit
-                        // for the set timeout if there are no data.
-                        let exit_check_interval = (wait_for_chunk_timeout / 10)
-                            .clamp(Duration::from_millis(10), Duration::from_secs(1));
-                        let mut start = Instant::now();
-                        while !stream_exit.load(Ordering::Relaxed) {
-                            if let Ok(chunk) = tokio::time::timeout(
-                                exit_check_interval,
-                                stream.read_chunk(PACKET_DATA_SIZE, false),
-                            )
-                            .await
-                            {
-                                if handle_chunk(
-                                    chunk,
-                                    &mut maybe_batch,
-                                    &remote_addr,
-                                    &packet_sender,
-                                    stats.clone(),
-                                    params.peer_type,
-                                )
-                                .await
-                                {
-                                    last_update.store(timing::timestamp(), Ordering::Relaxed);
-                                    break;
-                                }
-                                start = Instant::now();
-                            } else if start.elapsed() > wait_for_chunk_timeout {
-                                debug!("Timeout in receiving on stream");
-                                stats
-                                    .total_stream_read_timeouts
-                                    .fetch_add(1, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                        stats.total_streams.fetch_sub(1, Ordering::Relaxed);
-                        stream_load_ema.update_ema_if_needed();
-                    });
-                }
+    loop {
+        // Wait for new streams. If the peer is disconnected we get a cancellation signal and stop
+        // the connection task.
+        let mut stream = select! {
+            stream = connection.accept_uni() => match stream {
+                Ok(stream) => stream,
                 Err(e) => {
                     debug!("stream error: {:?}", e);
                     break;
                 }
+            },
+            _ = cancel.cancelled() => break,
+        };
+
+        let max_streams_per_throttling_interval = stream_load_ema
+            .available_load_capacity_in_throttling_duration(params.peer_type, params.total_stake);
+
+        let throttle_interval_start = stream_counter.reset_throttling_params_if_needed();
+        let streams_read_in_throttle_interval = stream_counter.stream_count.load(Ordering::Relaxed);
+        if streams_read_in_throttle_interval >= max_streams_per_throttling_interval {
+            // The peer is sending faster than we're willing to read. Sleep for what's
+            // left of this read interval so the peer backs off.
+            let throttle_duration =
+                STREAM_THROTTLING_INTERVAL.saturating_sub(throttle_interval_start.elapsed());
+
+            if !throttle_duration.is_zero() {
+                debug!("Throttling stream from {remote_addr:?}, peer type: {:?}, total stake: {}, \
+                                    max_streams_per_interval: {max_streams_per_throttling_interval}, read_interval_streams: {streams_read_in_throttle_interval} \
+                                    throttle_duration: {throttle_duration:?}",
+                                    params.peer_type, params.total_stake);
+                stats.throttled_streams.fetch_add(1, Ordering::Relaxed);
+                match params.peer_type {
+                    ConnectionPeerType::Unstaked => {
+                        stats
+                            .throttled_unstaked_streams
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    ConnectionPeerType::Staked(_) => {
+                        stats
+                            .throttled_staked_streams
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                sleep(throttle_duration).await;
             }
         }
+        stream_load_ema.increment_load(params.peer_type);
+        stream_counter.stream_count.fetch_add(1, Ordering::Relaxed);
+        stats.total_streams.fetch_add(1, Ordering::Relaxed);
+        stats.total_new_streams.fetch_add(1, Ordering::Relaxed);
+        let cancel = cancel.clone();
+        let stats = stats.clone();
+        let packet_sender = params.packet_sender.clone();
+        let last_update = last_update.clone();
+        let stream_load_ema = stream_load_ema.clone();
+        tokio::spawn(async move {
+            let mut maybe_batch = None;
+            loop {
+                // Read the next chunk, waiting up to `wait_for_chunk_timeout`. If we don't get a
+                // chunk before then, we assume the stream is dead and stop the stream task. This
+                // can only happen if there's severe packet loss or the peer stop sending for
+                // whatever reason.
+                let chunk = match tokio::select! {
+                    chunk = tokio::time::timeout(
+                        wait_for_chunk_timeout,
+                        stream.read_chunk(PACKET_DATA_SIZE, true)) => chunk,
+
+                    // If the peer gets disconnected stop the task right away.
+                    _ = cancel.cancelled() => break,
+                } {
+                    // read_chunk returned success
+                    Ok(Ok(chunk)) => chunk,
+                    // read_chunk returned error
+                    Ok(Err(e)) => {
+                        debug!("Received stream error: {:?}", e);
+                        stats
+                            .total_stream_read_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    // timeout elapsed
+                    Err(_) => {
+                        debug!("Timeout in receiving on stream");
+                        stats
+                            .total_stream_read_timeouts
+                            .fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                };
+
+                if handle_chunk(
+                    chunk,
+                    &mut maybe_batch,
+                    &remote_addr,
+                    &packet_sender,
+                    stats.clone(),
+                    params.peer_type,
+                )
+                .await
+                {
+                    last_update.store(timing::timestamp(), Ordering::Relaxed);
+                    break;
+                }
+            }
+
+            stats.total_streams.fetch_sub(1, Ordering::Relaxed);
+            stream_load_ema.update_ema_if_needed();
+        });
     }
 
     let removed_connection_count = connection_table.lock().await.remove_connection(
@@ -893,129 +901,117 @@ async fn handle_connection(
 
 // Return true if the server should drop the stream
 async fn handle_chunk(
-    chunk: Result<Option<quinn::Chunk>, quinn::ReadError>,
+    maybe_chunk: Option<quinn::Chunk>,
     packet_accum: &mut Option<PacketAccumulator>,
     remote_addr: &SocketAddr,
     packet_sender: &AsyncSender<PacketAccumulator>,
     stats: Arc<StreamStats>,
     peer_type: ConnectionPeerType,
 ) -> bool {
-    match chunk {
-        Ok(maybe_chunk) => {
-            if let Some(chunk) = maybe_chunk {
-                trace!("got chunk: {:?}", chunk);
-                let chunk_len = chunk.bytes.len() as u64;
+    if let Some(chunk) = maybe_chunk {
+        trace!("got chunk: {:?}", chunk);
+        let chunk_len = chunk.bytes.len() as u64;
 
-                // shouldn't happen, but sanity check the size and offsets
-                if chunk.offset > PACKET_DATA_SIZE as u64 || chunk_len > PACKET_DATA_SIZE as u64 {
-                    stats.total_invalid_chunks.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-                let Some(end_of_chunk) = chunk.offset.checked_add(chunk_len) else {
-                    return true;
-                };
-                if end_of_chunk > PACKET_DATA_SIZE as u64 {
-                    stats
-                        .total_invalid_chunk_size
-                        .fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-
-                // chunk looks valid
-                if packet_accum.is_none() {
-                    let mut meta = Meta::default();
-                    meta.set_socket_addr(remote_addr);
-                    meta.set_from_staked_node(matches!(peer_type, ConnectionPeerType::Staked(_)));
-                    *packet_accum = Some(PacketAccumulator {
-                        meta,
-                        chunks: SmallVec::new(),
-                    });
-                }
-
-                if let Some(accum) = packet_accum.as_mut() {
-                    let offset = chunk.offset;
-                    let Some(end_of_chunk) = (chunk.offset as usize).checked_add(chunk.bytes.len())
-                    else {
-                        return true;
-                    };
-                    accum.chunks.push(PacketChunk {
-                        bytes: chunk.bytes,
-                        offset: offset as usize,
-                        end_of_chunk,
-                    });
-
-                    accum.meta.size = std::cmp::max(accum.meta.size, end_of_chunk);
-                }
-
-                if peer_type.is_staked() {
-                    stats
-                        .total_staked_chunks_received
-                        .fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats
-                        .total_unstaked_chunks_received
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                // done receiving chunks
-                trace!("chunk is none");
-                if let Some(accum) = packet_accum.take() {
-                    let bytes_sent = accum.meta.size;
-                    let chunks_sent = accum.chunks.len();
-
-                    if let Err(err) = packet_sender.send(accum).await {
-                        stats
-                            .total_handle_chunk_to_packet_batcher_send_err
-                            .fetch_add(1, Ordering::Relaxed);
-                        trace!("packet batch send error {:?}", err);
-                    } else {
-                        stats
-                            .total_packets_sent_for_batching
-                            .fetch_add(1, Ordering::Relaxed);
-                        stats
-                            .total_bytes_sent_for_batching
-                            .fetch_add(bytes_sent, Ordering::Relaxed);
-                        stats
-                            .total_chunks_sent_for_batching
-                            .fetch_add(chunks_sent, Ordering::Relaxed);
-
-                        match peer_type {
-                            ConnectionPeerType::Unstaked => {
-                                stats
-                                    .total_unstaked_packets_sent_for_batching
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            ConnectionPeerType::Staked(_) => {
-                                stats
-                                    .total_staked_packets_sent_for_batching
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-
-                        trace!("sent {} byte packet for batching", bytes_sent);
-                    }
-                } else {
-                    stats
-                        .total_packet_batches_none
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                return true;
-            }
+        // shouldn't happen, but sanity check the size and offsets
+        if chunk.offset > PACKET_DATA_SIZE as u64 || chunk_len > PACKET_DATA_SIZE as u64 {
+            stats.total_invalid_chunks.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
-        Err(e) => {
-            debug!("Received stream error: {:?}", e);
+        let Some(end_of_chunk) = chunk.offset.checked_add(chunk_len) else {
+            return true;
+        };
+        if end_of_chunk > PACKET_DATA_SIZE as u64 {
             stats
-                .total_stream_read_errors
+                .total_invalid_chunk_size
                 .fetch_add(1, Ordering::Relaxed);
             return true;
         }
+
+        // chunk looks valid
+        if packet_accum.is_none() {
+            let mut meta = Meta::default();
+            meta.set_socket_addr(remote_addr);
+            meta.set_from_staked_node(matches!(peer_type, ConnectionPeerType::Staked(_)));
+            *packet_accum = Some(PacketAccumulator {
+                meta,
+                chunks: SmallVec::new(),
+            });
+        }
+
+        if let Some(accum) = packet_accum.as_mut() {
+            let offset = chunk.offset;
+            let Some(end_of_chunk) = (chunk.offset as usize).checked_add(chunk.bytes.len()) else {
+                return true;
+            };
+            accum.chunks.push(PacketChunk {
+                bytes: chunk.bytes,
+                offset: offset as usize,
+                end_of_chunk,
+            });
+
+            accum.meta.size = std::cmp::max(accum.meta.size, end_of_chunk);
+        }
+
+        if peer_type.is_staked() {
+            stats
+                .total_staked_chunks_received
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            stats
+                .total_unstaked_chunks_received
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        // done receiving chunks
+        trace!("chunk is none");
+        if let Some(accum) = packet_accum.take() {
+            let bytes_sent = accum.meta.size;
+            let chunks_sent = accum.chunks.len();
+
+            if let Err(err) = packet_sender.send(accum).await {
+                stats
+                    .total_handle_chunk_to_packet_batcher_send_err
+                    .fetch_add(1, Ordering::Relaxed);
+                trace!("packet batch send error {:?}", err);
+            } else {
+                stats
+                    .total_packets_sent_for_batching
+                    .fetch_add(1, Ordering::Relaxed);
+                stats
+                    .total_bytes_sent_for_batching
+                    .fetch_add(bytes_sent, Ordering::Relaxed);
+                stats
+                    .total_chunks_sent_for_batching
+                    .fetch_add(chunks_sent, Ordering::Relaxed);
+
+                match peer_type {
+                    ConnectionPeerType::Unstaked => {
+                        stats
+                            .total_unstaked_packets_sent_for_batching
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    ConnectionPeerType::Staked(_) => {
+                        stats
+                            .total_staked_packets_sent_for_batching
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                trace!("sent {} byte packet for batching", bytes_sent);
+            }
+        } else {
+            stats
+                .total_packet_batches_none
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        return true;
     }
     false
 }
 
 #[derive(Debug)]
 struct ConnectionEntry {
-    exit: Arc<AtomicBool>,
+    cancel: CancellationToken,
     peer_type: ConnectionPeerType,
     last_update: Arc<AtomicU64>,
     port: u16,
@@ -1025,7 +1021,7 @@ struct ConnectionEntry {
 
 impl ConnectionEntry {
     fn new(
-        exit: Arc<AtomicBool>,
+        cancel: CancellationToken,
         peer_type: ConnectionPeerType,
         last_update: Arc<AtomicU64>,
         port: u16,
@@ -1033,7 +1029,7 @@ impl ConnectionEntry {
         stream_counter: Arc<ConnectionStreamCounter>,
     ) -> Self {
         Self {
-            exit,
+            cancel,
             peer_type,
             last_update,
             port,
@@ -1062,7 +1058,7 @@ impl Drop for ConnectionEntry {
                 CONNECTION_CLOSE_REASON_DROPPED_ENTRY,
             );
         }
-        self.exit.store(true, Ordering::Relaxed);
+        self.cancel.cancel();
     }
 }
 
@@ -1150,7 +1146,7 @@ impl ConnectionTable {
         max_connections_per_peer: usize,
     ) -> Option<(
         Arc<AtomicU64>,
-        Arc<AtomicBool>,
+        CancellationToken,
         Arc<ConnectionStreamCounter>,
     )> {
         let connection_entry = self.table.entry(key).or_default();
@@ -1160,14 +1156,14 @@ impl ConnectionTable {
             .map(|c| c <= max_connections_per_peer)
             .unwrap_or(false);
         if has_connection_capacity {
-            let exit = Arc::new(AtomicBool::new(false));
+            let cancel = CancellationToken::new();
             let last_update = Arc::new(AtomicU64::new(last_update));
             let stream_counter = connection_entry
                 .first()
                 .map(|entry| entry.stream_counter.clone())
                 .unwrap_or(Arc::new(ConnectionStreamCounter::new()));
             connection_entry.push(ConnectionEntry::new(
-                exit.clone(),
+                cancel.clone(),
                 peer_type,
                 last_update.clone(),
                 port,
@@ -1175,7 +1171,7 @@ impl ConnectionTable {
                 stream_counter.clone(),
             ));
             self.total_size += 1;
-            Some((last_update, exit, stream_counter))
+            Some((last_update, cancel, stream_counter))
         } else {
             if let Some(connection) = connection {
                 connection.close(
@@ -1208,7 +1204,7 @@ impl ConnectionTable {
             });
             let new_size = e_ref.len();
             if e_ref.is_empty() {
-                e.remove_entry();
+                e.swap_remove_entry();
             }
             let connections_removed = old_size.saturating_sub(new_size);
             self.total_size = self.total_size.saturating_sub(connections_removed);
@@ -1216,904 +1212,5 @@ impl ConnectionTable {
         } else {
             0
         }
-    }
-}
-
-#[cfg(test)]
-pub mod test {
-    use std::collections::HashMap;
-    use std::net::Ipv4Addr;
-
-    use assert_matches::assert_matches;
-    use async_channel::unbounded as async_unbounded;
-    use crossbeam_channel::{unbounded, Receiver};
-    use quinn::{ClientConfig, IdleTimeout, TransportConfig};
-    use solana_sdk::net::DEFAULT_TPU_COALESCE;
-    use solana_sdk::quic::{QUIC_KEEP_ALIVE, QUIC_MAX_TIMEOUT};
-    use solana_sdk::signature::Keypair;
-    use solana_sdk::signer::Signer;
-    use tokio::time::sleep;
-
-    use super::*;
-    use crate::nonblocking::quic::compute_max_allowed_uni_streams;
-    use crate::quic::{MAX_STAKED_CONNECTIONS, MAX_UNSTAKED_CONNECTIONS};
-    use crate::tls_certificates::new_self_signed_tls_certificate;
-
-    struct SkipServerVerification;
-
-    impl SkipServerVerification {
-        fn new() -> Arc<Self> {
-            Arc::new(Self)
-        }
-    }
-
-    impl rustls::client::ServerCertVerifier for SkipServerVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls::Certificate,
-            _intermediates: &[rustls::Certificate],
-            _server_name: &rustls::ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp_response: &[u8],
-            _now: std::time::SystemTime,
-        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::ServerCertVerified::assertion())
-        }
-    }
-
-    pub fn get_client_config(keypair: &Keypair) -> ClientConfig {
-        let ipaddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let (cert, key) = new_self_signed_tls_certificate(keypair, ipaddr)
-            .expect("Failed to generate client certificate");
-
-        let mut crypto = rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
-            .with_client_auth_cert(vec![cert], key)
-            .expect("Failed to use client certificate");
-
-        crypto.enable_early_data = true;
-        crypto.alpn_protocols = vec![ALPN_TPU_PROTOCOL_ID.to_vec()];
-
-        let mut config = ClientConfig::new(Arc::new(crypto));
-
-        let mut transport_config = TransportConfig::default();
-        let timeout = IdleTimeout::try_from(QUIC_MAX_TIMEOUT).unwrap();
-        transport_config.max_idle_timeout(Some(timeout));
-        transport_config.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
-        config.transport_config(Arc::new(transport_config));
-
-        config
-    }
-
-    fn setup_quic_server(
-        option_staked_nodes: Option<StakedNodes>,
-        max_connections_per_peer: usize,
-    ) -> (
-        JoinHandle<()>,
-        Arc<AtomicBool>,
-        crossbeam_channel::Receiver<PacketBatch>,
-        SocketAddr,
-        Arc<StreamStats>,
-    ) {
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let exit = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = unbounded();
-        let keypair = Keypair::new();
-        let ip = "127.0.0.1".parse().unwrap();
-        let server_address = s.local_addr().unwrap();
-        let staked_nodes = Arc::new(RwLock::new(option_staked_nodes.unwrap_or_default()));
-        let SpawnNonBlockingServerResult {
-            endpoint: _,
-            stats,
-            thread: t,
-            max_concurrent_connections: _,
-        } = spawn_server(
-            "quic_streamer_test",
-            s,
-            &keypair,
-            ip,
-            sender,
-            exit.clone(),
-            max_connections_per_peer,
-            staked_nodes,
-            MAX_STAKED_CONNECTIONS,
-            MAX_UNSTAKED_CONNECTIONS,
-            DEFAULT_MAX_STREAMS_PER_MS,
-            Duration::from_secs(2),
-            DEFAULT_TPU_COALESCE,
-        )
-        .unwrap();
-        (t, exit, receiver, server_address, stats)
-    }
-
-    pub async fn make_client_endpoint(
-        addr: &SocketAddr,
-        client_keypair: Option<&Keypair>,
-    ) -> Connection {
-        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut endpoint = quinn::Endpoint::new(
-            EndpointConfig::default(),
-            None,
-            client_socket,
-            Arc::new(TokioRuntime),
-        )
-        .unwrap();
-        let default_keypair = Keypair::new();
-        endpoint.set_default_client_config(get_client_config(
-            client_keypair.unwrap_or(&default_keypair),
-        ));
-        endpoint
-            .connect(*addr, "localhost")
-            .expect("Failed in connecting")
-            .await
-            .expect("Failed in waiting")
-    }
-
-    pub async fn check_timeout(receiver: Receiver<PacketBatch>, server_address: SocketAddr) {
-        let conn1 = make_client_endpoint(&server_address, None).await;
-        let total = 30;
-        for i in 0..total {
-            let mut s1 = conn1.open_uni().await.unwrap();
-            s1.write_all(&[0u8]).await.unwrap();
-            s1.finish().await.unwrap();
-            info!("done {}", i);
-            sleep(Duration::from_millis(1000)).await;
-        }
-        let mut received = 0;
-        loop {
-            if let Ok(_x) = receiver.try_recv() {
-                received += 1;
-                info!("got {}", received);
-            } else {
-                sleep(Duration::from_millis(500)).await;
-            }
-            if received >= total {
-                break;
-            }
-        }
-    }
-
-    pub async fn check_block_multiple_connections(server_address: SocketAddr) {
-        let conn1 = make_client_endpoint(&server_address, None).await;
-        let conn2 = make_client_endpoint(&server_address, None).await;
-        let mut s1 = conn1.open_uni().await.unwrap();
-        let s2 = conn2.open_uni().await;
-        if let Ok(mut s2) = s2 {
-            s1.write_all(&[0u8]).await.unwrap();
-            s1.finish().await.unwrap();
-            // Send enough data to create more than 1 chunks.
-            // The first will try to open the connection (which should fail).
-            // The following chunks will enable the detection of connection failure.
-            let data = vec![1u8; PACKET_DATA_SIZE * 2];
-            s2.write_all(&data)
-                .await
-                .expect_err("shouldn't be able to open 2 connections");
-            s2.finish()
-                .await
-                .expect_err("shouldn't be able to open 2 connections");
-        } else {
-            // It has been noticed if there is already connection open against the server, this open_uni can fail
-            // with ApplicationClosed(ApplicationClose) error due to CONNECTION_CLOSE_CODE_TOO_MANY before writing to
-            // the stream -- expect it.
-            assert_matches!(s2, Err(quinn::ConnectionError::ApplicationClosed(_)));
-        }
-    }
-
-    pub async fn check_multiple_streams(
-        receiver: Receiver<PacketBatch>,
-        server_address: SocketAddr,
-    ) {
-        let conn1 = Arc::new(make_client_endpoint(&server_address, None).await);
-        let conn2 = Arc::new(make_client_endpoint(&server_address, None).await);
-        let mut num_expected_packets = 0;
-        for i in 0..10 {
-            info!("sending: {}", i);
-            let c1 = conn1.clone();
-            let c2 = conn2.clone();
-            let mut s1 = c1.open_uni().await.unwrap();
-            let mut s2 = c2.open_uni().await.unwrap();
-            s1.write_all(&[0u8]).await.unwrap();
-            s1.finish().await.unwrap();
-            s2.write_all(&[0u8]).await.unwrap();
-            s2.finish().await.unwrap();
-            num_expected_packets += 2;
-            sleep(Duration::from_millis(200)).await;
-        }
-        let mut all_packets = vec![];
-        let now = Instant::now();
-        let mut total_packets = 0;
-        while now.elapsed().as_secs() < 10 {
-            if let Ok(packets) = receiver.try_recv() {
-                total_packets += packets.len();
-                all_packets.push(packets)
-            } else {
-                sleep(Duration::from_secs(1)).await;
-            }
-            if total_packets == num_expected_packets {
-                break;
-            }
-        }
-        for batch in all_packets {
-            for p in batch.iter() {
-                assert_eq!(p.meta().size, 1);
-            }
-        }
-        assert_eq!(total_packets, num_expected_packets);
-    }
-
-    pub async fn check_multiple_writes(
-        receiver: Receiver<PacketBatch>,
-        server_address: SocketAddr,
-        client_keypair: Option<&Keypair>,
-    ) {
-        let conn1 = Arc::new(make_client_endpoint(&server_address, client_keypair).await);
-
-        // Send a full size packet with single byte writes.
-        let num_bytes = PACKET_DATA_SIZE;
-        let num_expected_packets = 1;
-        let mut s1 = conn1.open_uni().await.unwrap();
-        for _ in 0..num_bytes {
-            s1.write_all(&[0u8]).await.unwrap();
-        }
-        s1.finish().await.unwrap();
-
-        let mut all_packets = vec![];
-        let now = Instant::now();
-        let mut total_packets = 0;
-        while now.elapsed().as_secs() < 5 {
-            // We're running in an async environment, we (almost) never
-            // want to block
-            if let Ok(packets) = receiver.try_recv() {
-                total_packets += packets.len();
-                all_packets.push(packets)
-            } else {
-                sleep(Duration::from_secs(1)).await;
-            }
-            if total_packets >= num_expected_packets {
-                break;
-            }
-        }
-        for batch in all_packets {
-            for p in batch.iter() {
-                assert_eq!(p.meta().size, num_bytes);
-            }
-        }
-        assert_eq!(total_packets, num_expected_packets);
-    }
-
-    pub async fn check_unstaked_node_connect_failure(server_address: SocketAddr) {
-        let conn1 = Arc::new(make_client_endpoint(&server_address, None).await);
-
-        // Send a full size packet with single byte writes.
-        if let Ok(mut s1) = conn1.open_uni().await {
-            for _ in 0..PACKET_DATA_SIZE {
-                // Ignoring any errors here. s1.finish() will test the error condition
-                s1.write_all(&[0u8]).await.unwrap_or_default();
-            }
-            s1.finish().await.unwrap_err();
-        }
-    }
-
-    #[tokio::test]
-    async fn test_quic_server_exit() {
-        let (t, exit, _receiver, _server_address, _stats) = setup_quic_server(None, 1);
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_quic_timeout() {
-        solana_logger::setup();
-        let (t, exit, receiver, server_address, _stats) = setup_quic_server(None, 1);
-        check_timeout(receiver, server_address).await;
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_packet_batcher() {
-        solana_logger::setup();
-        let (pkt_batch_sender, pkt_batch_receiver) = unbounded();
-        let (ptk_sender, pkt_receiver) = async_unbounded();
-        let exit = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(StreamStats::default());
-
-        let handle = tokio::spawn(packet_batch_sender(
-            pkt_batch_sender,
-            pkt_receiver,
-            exit.clone(),
-            stats,
-            DEFAULT_TPU_COALESCE,
-        ));
-
-        let num_packets = 1000;
-
-        for _i in 0..num_packets {
-            let mut meta = Meta::default();
-            let bytes = Bytes::from("Hello world");
-            let offset = 0;
-            let size = bytes.len();
-            meta.size = size;
-            let packet_accum = PacketAccumulator {
-                meta,
-                chunks: smallvec::smallvec![PacketChunk {
-                    bytes,
-                    offset,
-                    end_of_chunk: size,
-                }],
-            };
-            ptk_sender.send(packet_accum).await.unwrap();
-        }
-        let mut i = 0;
-        let start = Instant::now();
-        while i < num_packets && start.elapsed().as_secs() < 2 {
-            if let Ok(batch) = pkt_batch_receiver.try_recv() {
-                i += batch.len();
-            } else {
-                sleep(Duration::from_millis(1)).await;
-            }
-        }
-        assert_eq!(i, num_packets);
-        exit.store(true, Ordering::Relaxed);
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_quic_stream_timeout() {
-        solana_logger::setup();
-        let (t, exit, _receiver, server_address, stats) = setup_quic_server(None, 1);
-
-        let conn1 = make_client_endpoint(&server_address, None).await;
-        assert_eq!(stats.total_streams.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.total_stream_read_timeouts.load(Ordering::Relaxed), 0);
-
-        // Send one byte to start the stream
-        let mut s1 = conn1.open_uni().await.unwrap();
-        s1.write_all(&[0u8]).await.unwrap_or_default();
-
-        // Wait long enough for the stream to timeout in receiving chunks
-        let sleep_time = Duration::from_secs(3).min(WAIT_FOR_STREAM_TIMEOUT * 1000);
-        sleep(sleep_time).await;
-
-        // Test that the stream was created, but timed out in read
-        assert_eq!(stats.total_streams.load(Ordering::Relaxed), 0);
-        assert_ne!(stats.total_stream_read_timeouts.load(Ordering::Relaxed), 0);
-
-        // Test that more writes to the stream will fail (i.e. the stream is no longer writable
-        // after the timeouts)
-        assert!(s1.write_all(&[0u8]).await.is_err());
-        assert!(s1.finish().await.is_err());
-
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_quic_server_block_multiple_connections() {
-        solana_logger::setup();
-        let (t, exit, _receiver, server_address, _stats) = setup_quic_server(None, 1);
-        check_block_multiple_connections(server_address).await;
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_quic_server_multiple_connections_on_single_client_endpoint() {
-        solana_logger::setup();
-        let (t, exit, _receiver, server_address, stats) = setup_quic_server(None, 2);
-
-        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut endpoint = quinn::Endpoint::new(
-            EndpointConfig::default(),
-            None,
-            client_socket,
-            Arc::new(TokioRuntime),
-        )
-        .unwrap();
-        let default_keypair = Keypair::new();
-        endpoint.set_default_client_config(get_client_config(&default_keypair));
-        let conn1 = endpoint
-            .connect(server_address, "localhost")
-            .expect("Failed in connecting")
-            .await
-            .expect("Failed in waiting");
-
-        let conn2 = endpoint
-            .connect(server_address, "localhost")
-            .expect("Failed in connecting")
-            .await
-            .expect("Failed in waiting");
-
-        let mut s1 = conn1.open_uni().await.unwrap();
-        s1.write_all(&[0u8]).await.unwrap();
-        s1.finish().await.unwrap();
-
-        let mut s2 = conn2.open_uni().await.unwrap();
-        conn1.close(
-            CONNECTION_CLOSE_CODE_DROPPED_ENTRY.into(),
-            CONNECTION_CLOSE_REASON_DROPPED_ENTRY,
-        );
-        // Wait long enough for the stream to timeout in receiving chunks
-        let sleep_time = Duration::from_secs(1).min(WAIT_FOR_STREAM_TIMEOUT * 1000);
-        sleep(sleep_time).await;
-
-        assert_eq!(stats.connection_removed.load(Ordering::Relaxed), 1);
-
-        s2.write_all(&[0u8]).await.unwrap();
-        s2.finish().await.unwrap();
-
-        conn2.close(
-            CONNECTION_CLOSE_CODE_DROPPED_ENTRY.into(),
-            CONNECTION_CLOSE_REASON_DROPPED_ENTRY,
-        );
-        // Wait long enough for the stream to timeout in receiving chunks
-        let sleep_time = Duration::from_secs(1).min(WAIT_FOR_STREAM_TIMEOUT * 1000);
-        sleep(sleep_time).await;
-
-        assert_eq!(stats.connection_removed.load(Ordering::Relaxed), 2);
-
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_quic_server_multiple_writes() {
-        solana_logger::setup();
-        let (t, exit, receiver, server_address, _stats) = setup_quic_server(None, 1);
-        check_multiple_writes(receiver, server_address, None).await;
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_quic_server_staked_connection_removal() {
-        solana_logger::setup();
-
-        let client_keypair = Keypair::new();
-        let stakes = HashMap::from([(client_keypair.pubkey(), 100_000)]);
-        let staked_nodes = StakedNodes::new(
-            Arc::new(stakes),
-            HashMap::<Pubkey, u64>::default(), // overrides
-        );
-        let (t, exit, receiver, server_address, stats) = setup_quic_server(Some(staked_nodes), 1);
-        check_multiple_writes(receiver, server_address, Some(&client_keypair)).await;
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-        sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            stats
-                .connection_added_from_unstaked_peer
-                .load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(stats.connection_removed.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.connection_remove_failed.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn test_quic_server_zero_staked_connection_removal() {
-        // In this test, the client has a pubkey, but is not in stake table.
-        solana_logger::setup();
-
-        let client_keypair = Keypair::new();
-        let stakes = HashMap::from([(client_keypair.pubkey(), 0)]);
-        let staked_nodes = StakedNodes::new(
-            Arc::new(stakes),
-            HashMap::<Pubkey, u64>::default(), // overrides
-        );
-        let (t, exit, receiver, server_address, stats) = setup_quic_server(Some(staked_nodes), 1);
-        check_multiple_writes(receiver, server_address, Some(&client_keypair)).await;
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-        sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            stats
-                .connection_added_from_staked_peer
-                .load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(stats.connection_removed.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.connection_remove_failed.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn test_quic_server_unstaked_connection_removal() {
-        solana_logger::setup();
-        let (t, exit, receiver, server_address, stats) = setup_quic_server(None, 1);
-        check_multiple_writes(receiver, server_address, None).await;
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-        sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            stats
-                .connection_added_from_staked_peer
-                .load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(stats.connection_removed.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.connection_remove_failed.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn test_quic_server_unstaked_node_connect_failure() {
-        solana_logger::setup();
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let exit = Arc::new(AtomicBool::new(false));
-        let (sender, _) = unbounded();
-        let keypair = Keypair::new();
-        let ip = "127.0.0.1".parse().unwrap();
-        let server_address = s.local_addr().unwrap();
-        let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
-        let SpawnNonBlockingServerResult {
-            endpoint: _,
-            stats: _,
-            thread: t,
-            max_concurrent_connections: _,
-        } = spawn_server(
-            "quic_streamer_test",
-            s,
-            &keypair,
-            ip,
-            sender,
-            exit.clone(),
-            1,
-            staked_nodes,
-            MAX_STAKED_CONNECTIONS,
-            0, // Do not allow any connection from unstaked clients/nodes
-            DEFAULT_MAX_STREAMS_PER_MS,
-            DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
-            DEFAULT_TPU_COALESCE,
-        )
-        .unwrap();
-
-        check_unstaked_node_connect_failure(server_address).await;
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_quic_server_multiple_streams() {
-        solana_logger::setup();
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let exit = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = unbounded();
-        let keypair = Keypair::new();
-        let ip = "127.0.0.1".parse().unwrap();
-        let server_address = s.local_addr().unwrap();
-        let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
-        let SpawnNonBlockingServerResult {
-            endpoint: _,
-            stats,
-            thread: t,
-            max_concurrent_connections: _,
-        } = spawn_server(
-            "quic_streamer_test",
-            s,
-            &keypair,
-            ip,
-            sender,
-            exit.clone(),
-            2,
-            staked_nodes,
-            MAX_STAKED_CONNECTIONS,
-            MAX_UNSTAKED_CONNECTIONS,
-            DEFAULT_MAX_STREAMS_PER_MS,
-            DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
-            DEFAULT_TPU_COALESCE,
-        )
-        .unwrap();
-
-        check_multiple_streams(receiver, server_address).await;
-        assert_eq!(stats.total_streams.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.total_new_streams.load(Ordering::Relaxed), 20);
-        assert_eq!(stats.total_connections.load(Ordering::Relaxed), 2);
-        assert_eq!(stats.total_new_connections.load(Ordering::Relaxed), 2);
-        exit.store(true, Ordering::Relaxed);
-        t.await.unwrap();
-        assert_eq!(stats.total_connections.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.total_new_connections.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn test_prune_table_with_ip() {
-        use std::net::Ipv4Addr;
-        solana_logger::setup();
-        let mut table = ConnectionTable::new();
-        let mut num_entries = 5;
-        let max_connections_per_peer = 10;
-        let sockets: Vec<_> = (0..num_entries)
-            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i, 0, 0, 0)), 0))
-            .collect();
-        for (i, socket) in sockets.iter().enumerate() {
-            table
-                .try_add_connection(
-                    ConnectionTableKey::IP(socket.ip()),
-                    socket.port(),
-                    None,
-                    ConnectionPeerType::Unstaked,
-                    i as u64,
-                    max_connections_per_peer,
-                )
-                .unwrap();
-        }
-        num_entries += 1;
-        table
-            .try_add_connection(
-                ConnectionTableKey::IP(sockets[0].ip()),
-                sockets[0].port(),
-                None,
-                ConnectionPeerType::Unstaked,
-                5,
-                max_connections_per_peer,
-            )
-            .unwrap();
-
-        let new_size = 3;
-        let pruned = table.prune_oldest(new_size);
-        assert_eq!(pruned, num_entries as usize - new_size);
-        for v in table.table.values() {
-            for x in v {
-                assert!((x.last_update() + 1) >= (num_entries as u64 - new_size as u64));
-            }
-        }
-        assert_eq!(table.table.len(), new_size);
-        assert_eq!(table.total_size, new_size);
-        for socket in sockets.iter().take(num_entries as usize).skip(new_size - 1) {
-            table.remove_connection(ConnectionTableKey::IP(socket.ip()), socket.port(), 0);
-        }
-        assert_eq!(table.total_size, 0);
-    }
-
-    #[test]
-    fn test_prune_table_with_unique_pubkeys() {
-        solana_logger::setup();
-        let mut table = ConnectionTable::new();
-
-        // We should be able to add more entries than max_connections_per_peer, since each entry is
-        // from a different peer pubkey.
-        let num_entries = 15;
-        let max_connections_per_peer = 10;
-
-        let pubkeys: Vec<_> = (0..num_entries).map(|_| Pubkey::new_unique()).collect();
-        for (i, pubkey) in pubkeys.iter().enumerate() {
-            table
-                .try_add_connection(
-                    ConnectionTableKey::Pubkey(*pubkey),
-                    0,
-                    None,
-                    ConnectionPeerType::Unstaked,
-                    i as u64,
-                    max_connections_per_peer,
-                )
-                .unwrap();
-        }
-
-        let new_size = 3;
-        let pruned = table.prune_oldest(new_size);
-        assert_eq!(pruned, num_entries as usize - new_size);
-        assert_eq!(table.table.len(), new_size);
-        assert_eq!(table.total_size, new_size);
-        for pubkey in pubkeys.iter().take(num_entries as usize).skip(new_size - 1) {
-            table.remove_connection(ConnectionTableKey::Pubkey(*pubkey), 0, 0);
-        }
-        assert_eq!(table.total_size, 0);
-    }
-
-    #[test]
-    fn test_prune_table_with_non_unique_pubkeys() {
-        solana_logger::setup();
-        let mut table = ConnectionTable::new();
-
-        let max_connections_per_peer = 10;
-        let pubkey = Pubkey::new_unique();
-        (0..max_connections_per_peer).for_each(|i| {
-            table
-                .try_add_connection(
-                    ConnectionTableKey::Pubkey(pubkey),
-                    0,
-                    None,
-                    ConnectionPeerType::Unstaked,
-                    i as u64,
-                    max_connections_per_peer,
-                )
-                .unwrap();
-        });
-
-        // We should NOT be able to add more entries than max_connections_per_peer, since we are
-        // using the same peer pubkey.
-        assert!(table
-            .try_add_connection(
-                ConnectionTableKey::Pubkey(pubkey),
-                0,
-                None,
-                ConnectionPeerType::Unstaked,
-                10,
-                max_connections_per_peer,
-            )
-            .is_none());
-
-        // We should be able to add an entry from another peer pubkey
-        let num_entries = max_connections_per_peer + 1;
-        let pubkey2 = Pubkey::new_unique();
-        assert!(table
-            .try_add_connection(
-                ConnectionTableKey::Pubkey(pubkey2),
-                0,
-                None,
-                ConnectionPeerType::Unstaked,
-                10,
-                max_connections_per_peer,
-            )
-            .is_some());
-
-        assert_eq!(table.total_size, num_entries);
-
-        let new_max_size = 3;
-        let pruned = table.prune_oldest(new_max_size);
-        assert!(pruned >= num_entries - new_max_size);
-        assert!(table.table.len() <= new_max_size);
-        assert!(table.total_size <= new_max_size);
-
-        table.remove_connection(ConnectionTableKey::Pubkey(pubkey2), 0, 0);
-        assert_eq!(table.total_size, 0);
-    }
-
-    #[test]
-    fn test_prune_table_random() {
-        use std::net::Ipv4Addr;
-        solana_logger::setup();
-        let mut table = ConnectionTable::new();
-        let num_entries = 5;
-        let max_connections_per_peer = 10;
-        let sockets: Vec<_> = (0..num_entries)
-            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i, 0, 0, 0)), 0))
-            .collect();
-        for (i, socket) in sockets.iter().enumerate() {
-            table
-                .try_add_connection(
-                    ConnectionTableKey::IP(socket.ip()),
-                    socket.port(),
-                    None,
-                    ConnectionPeerType::Staked((i + 1) as u64),
-                    i as u64,
-                    max_connections_per_peer,
-                )
-                .unwrap();
-        }
-
-        // Try pruninng with threshold stake less than all the entries in the table
-        // It should fail to prune (i.e. return 0 number of pruned entries)
-        let pruned = table.prune_random(/*sample_size:*/ 2, /*threshold_stake:*/ 0);
-        assert_eq!(pruned, 0);
-
-        // Try pruninng with threshold stake higher than all the entries in the table
-        // It should succeed to prune (i.e. return 1 number of pruned entries)
-        let pruned = table.prune_random(
-            2,                      // sample_size
-            num_entries as u64 + 1, // threshold_stake
-        );
-        assert_eq!(pruned, 1);
-    }
-
-    #[test]
-    fn test_remove_connections() {
-        use std::net::Ipv4Addr;
-        solana_logger::setup();
-        let mut table = ConnectionTable::new();
-        let num_ips = 5;
-        let max_connections_per_peer = 10;
-        let mut sockets: Vec<_> = (0..num_ips)
-            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i, 0, 0, 0)), 0))
-            .collect();
-        for (i, socket) in sockets.iter().enumerate() {
-            table
-                .try_add_connection(
-                    ConnectionTableKey::IP(socket.ip()),
-                    socket.port(),
-                    None,
-                    ConnectionPeerType::Unstaked,
-                    (i * 2) as u64,
-                    max_connections_per_peer,
-                )
-                .unwrap();
-
-            table
-                .try_add_connection(
-                    ConnectionTableKey::IP(socket.ip()),
-                    socket.port(),
-                    None,
-                    ConnectionPeerType::Unstaked,
-                    (i * 2 + 1) as u64,
-                    max_connections_per_peer,
-                )
-                .unwrap();
-        }
-
-        let single_connection_addr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(num_ips, 0, 0, 0)), 0);
-        table
-            .try_add_connection(
-                ConnectionTableKey::IP(single_connection_addr.ip()),
-                single_connection_addr.port(),
-                None,
-                ConnectionPeerType::Unstaked,
-                (num_ips * 2) as u64,
-                max_connections_per_peer,
-            )
-            .unwrap();
-
-        let zero_connection_addr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(num_ips + 1, 0, 0, 0)), 0);
-
-        sockets.push(single_connection_addr);
-        sockets.push(zero_connection_addr);
-
-        for socket in sockets.iter() {
-            table.remove_connection(ConnectionTableKey::IP(socket.ip()), socket.port(), 0);
-        }
-        assert_eq!(table.total_size, 0);
-    }
-
-    #[test]
-
-    fn test_max_allowed_uni_streams() {
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Unstaked, 0),
-            QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS
-        );
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Staked(10), 0),
-            QUIC_MIN_STAKED_CONCURRENT_STREAMS
-        );
-        let delta =
-            (QUIC_TOTAL_STAKED_CONCURRENT_STREAMS - QUIC_MIN_STAKED_CONCURRENT_STREAMS) as f64;
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Staked(1000), 10000),
-            QUIC_MAX_STAKED_CONCURRENT_STREAMS,
-        );
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Staked(100), 10000),
-            ((delta / (100_f64)) as usize + QUIC_MIN_STAKED_CONCURRENT_STREAMS)
-                .min(QUIC_MAX_STAKED_CONCURRENT_STREAMS)
-        );
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Unstaked, 10000),
-            QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS
-        );
-    }
-
-    #[test]
-    fn test_cacluate_receive_window_ratio_for_staked_node() {
-        let mut max_stake = 10000;
-        let mut min_stake = 0;
-        let ratio = compute_receive_window_ratio_for_staked_node(max_stake, min_stake, min_stake);
-        assert_eq!(ratio, QUIC_MIN_STAKED_RECEIVE_WINDOW_RATIO);
-
-        let ratio = compute_receive_window_ratio_for_staked_node(max_stake, min_stake, max_stake);
-        let max_ratio = QUIC_MAX_STAKED_RECEIVE_WINDOW_RATIO;
-        assert_eq!(ratio, max_ratio);
-
-        let ratio =
-            compute_receive_window_ratio_for_staked_node(max_stake, min_stake, max_stake / 2);
-        let average_ratio =
-            (QUIC_MAX_STAKED_RECEIVE_WINDOW_RATIO + QUIC_MIN_STAKED_RECEIVE_WINDOW_RATIO) / 2;
-        assert_eq!(ratio, average_ratio);
-
-        max_stake = 10000;
-        min_stake = 10000;
-        let ratio = compute_receive_window_ratio_for_staked_node(max_stake, min_stake, max_stake);
-        assert_eq!(ratio, max_ratio);
-
-        max_stake = 0;
-        min_stake = 0;
-        let ratio = compute_receive_window_ratio_for_staked_node(max_stake, min_stake, max_stake);
-        assert_eq!(ratio, max_ratio);
-
-        max_stake = 1000;
-        min_stake = 10;
-        let ratio =
-            compute_receive_window_ratio_for_staked_node(max_stake, min_stake, max_stake + 10);
-        assert_eq!(ratio, max_ratio);
     }
 }
